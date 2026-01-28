@@ -148,6 +148,17 @@ echo "User: ${DB_USER}"
 echo "Port: ${DB_PORT}"
 echo ""
 
+# Optional: initialize application schema + seed data
+# (kept separate so startup remains minimal; can be skipped by setting SKIP_APP_INIT=1)
+if [ "${SKIP_APP_INIT}" != "1" ] && [ -f "./init_schema_and_seed.sh" ]; then
+    echo ""
+    echo "Initializing app schema + seed data..."
+    bash ./init_schema_and_seed.sh || echo "⚠ App schema/seed init failed (see output above)"
+else
+    echo ""
+    echo "Skipping app schema + seed init (set SKIP_APP_INIT!=1 and ensure init_schema_and_seed.sh exists)."
+fi
+
 echo "Environment variables saved to db_visualizer/postgres.env"
 echo "To use with Node.js viewer, run: source db_visualizer/postgres.env"
 
