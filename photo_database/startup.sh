@@ -13,6 +13,9 @@ DB_PASSWORD="dbuser123"
 # Prefer platform-provided PORT (readiness checks use this). Allow DB_PORT override.
 DB_PORT="${DB_PORT:-${PORT:-5001}}"
 
+DATA_DIR="/var/lib/postgresql/data"
+PID_FILE="${DATA_DIR}/postmaster.pid"
+
 echo "Starting PostgreSQL setup on port ${DB_PORT}..."
 
 # Find PostgreSQL version and set paths
@@ -21,8 +24,52 @@ PG_BIN="/usr/lib/postgresql/${PG_VERSION}/bin"
 
 echo "Found PostgreSQL version: ${PG_VERSION}"
 
-# Check if PostgreSQL is already running on the specified port
-if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
+stop_existing_postgres_if_any () {
+    # If postgres is already running using this data dir, it will have a PID file.
+    # We must avoid starting a second postmaster on the same data directory.
+    if [ ! -f "${PID_FILE}" ]; then
+        return 0
+    fi
+
+    local existing_pid
+    existing_pid="$(head -n 1 "${PID_FILE}" 2>/dev/null || true)"
+
+    if [ -z "${existing_pid}" ]; then
+        echo "⚠ Found ${PID_FILE} but could not read PID. Removing stale PID file."
+        sudo rm -f "${PID_FILE}" || true
+        return 0
+    fi
+
+    if ! ps -p "${existing_pid}" >/dev/null 2>&1; then
+        echo "⚠ Found stale PID file for PID ${existing_pid}. Removing ${PID_FILE}."
+        sudo rm -f "${PID_FILE}" || true
+        return 0
+    fi
+
+    # Postgres is running. If it's not already serving on the desired port, restart it.
+    if sudo -u postgres "${PG_BIN}/pg_isready" -p "${DB_PORT}" >/dev/null 2>&1; then
+        echo "PostgreSQL is already running and accepting connections on port ${DB_PORT}."
+        return 0
+    fi
+
+    echo "⚠ PostgreSQL is running (PID ${existing_pid}) but not accepting on port ${DB_PORT}."
+    echo "   Stopping it so we can restart on port ${DB_PORT}..."
+
+    # Try fast/clean shutdown first.
+    if sudo -u postgres "${PG_BIN}/pg_ctl" -D "${DATA_DIR}" -m fast stop >/dev/null 2>&1; then
+        echo "✓ Existing PostgreSQL stopped."
+    else
+        echo "⚠ pg_ctl stop failed; sending SIGTERM to PID ${existing_pid}..."
+        sudo kill -TERM "${existing_pid}" >/dev/null 2>&1 || true
+        sleep 2
+    fi
+
+    # Ensure stale lock removed so new postmaster can start.
+    sudo rm -f "${PID_FILE}" >/dev/null 2>&1 || true
+}
+
+# If PostgreSQL is already running on the specified port, exit early.
+if sudo -u postgres "${PG_BIN}/pg_isready" -p "${DB_PORT}" >/dev/null 2>&1; then
     echo "PostgreSQL is already running on port ${DB_PORT}!"
     echo "Database: ${DB_NAME}"
     echo "User: ${DB_USER}"
@@ -30,60 +77,54 @@ if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
     echo ""
     echo "To connect to the database, use:"
     echo "psql -h localhost -U ${DB_USER} -d ${DB_NAME} -p ${DB_PORT}"
-    
-    # Check if connection info file exists
+
     if [ -f "db_connection.txt" ]; then
         echo "Or use: $(cat db_connection.txt)"
     fi
-    
+
     echo ""
     echo "Script stopped - server already running."
     exit 0
 fi
 
-# Also check if there's a PostgreSQL process running (in case pg_isready fails)
-if pgrep -f "postgres.*-p ${DB_PORT}" > /dev/null 2>&1; then
-    echo "Found existing PostgreSQL process on port ${DB_PORT}"
-    echo "Attempting to verify connection..."
-    
-    # Try to connect and verify the database exists
-    if sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -c '\q' 2>/dev/null; then
-        echo "Database ${DB_NAME} is accessible."
-        echo "Script stopped - server already running."
-        exit 0
-    fi
-fi
+# If another postmaster is running on the same data dir but a different port,
+# stop it so we can reliably bind to the platform readiness port.
+stop_existing_postgres_if_any
 
 # Initialize PostgreSQL data directory if it doesn't exist
-if [ ! -f "/var/lib/postgresql/data/PG_VERSION" ]; then
+if [ ! -f "${DATA_DIR}/PG_VERSION" ]; then
     echo "Initializing PostgreSQL..."
-    sudo -u postgres ${PG_BIN}/initdb -D /var/lib/postgresql/data
+    sudo -u postgres "${PG_BIN}/initdb" -D "${DATA_DIR}"
 fi
 
 # Start PostgreSQL server in background
 echo "Starting PostgreSQL server..."
-sudo -u postgres ${PG_BIN}/postgres -D /var/lib/postgresql/data -p ${DB_PORT} &
+sudo -u postgres "${PG_BIN}/postgres" -D "${DATA_DIR}" -p "${DB_PORT}" &
 
 # Wait for PostgreSQL to start
 echo "Waiting for PostgreSQL to start..."
-sleep 5
-
-# Check if PostgreSQL is running
-for i in {1..15}; do
-    if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
+for i in {1..30}; do
+    if sudo -u postgres "${PG_BIN}/pg_isready" -p "${DB_PORT}" >/dev/null 2>&1; then
         echo "PostgreSQL is ready!"
         break
     fi
-    echo "Waiting... ($i/15)"
-    sleep 2
+    echo "Waiting... ($i/30)"
+    sleep 1
 done
+
+# Hard fail if DB never became ready. This prevents writing misleading connection info.
+if ! sudo -u postgres "${PG_BIN}/pg_isready" -p "${DB_PORT}" >/dev/null 2>&1; then
+    echo "❌ PostgreSQL did not become ready on port ${DB_PORT}."
+    echo "   Check for port conflicts or startup errors."
+    exit 1
+fi
 
 # Create database and user
 echo "Setting up database and user..."
-sudo -u postgres ${PG_BIN}/createdb -p ${DB_PORT} ${DB_NAME} 2>/dev/null || echo "Database might already exist"
+sudo -u postgres "${PG_BIN}/createdb" -h localhost -p "${DB_PORT}" "${DB_NAME}" 2>/dev/null || echo "Database might already exist"
 
 # Set up user and permissions with proper schema ownership
-sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d postgres << EOF
+sudo -u postgres "${PG_BIN}/psql" -h localhost -p "${DB_PORT}" -d postgres << EOF
 -- Create user if doesn't exist
 DO \$\$
 BEGIN
@@ -112,10 +153,6 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TYPES TO ${DB_USER};
-
--- If you want the user to be able to create objects without restrictions,
--- you can make them the owner of the public schema (optional but effective)
--- ALTER SCHEMA public OWNER TO ${DB_USER};
 
 -- Alternative: Grant all privileges on schema public to the user
 GRANT ALL ON SCHEMA public TO ${DB_USER};
