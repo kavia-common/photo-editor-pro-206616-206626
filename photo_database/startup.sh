@@ -1,12 +1,19 @@
 #!/bin/bash
 
 # Minimal PostgreSQL startup script with full paths
+#
+# NOTE:
+# This container is expected to expose PostgreSQL on the container's `PORT`
+# (see .env). Historically this script hard-coded 5000, which caused readiness
+# checks to fail when the platform expects port 5001.
 DB_NAME="myapp"
 DB_USER="appuser"
 DB_PASSWORD="dbuser123"
-DB_PORT="5000"
 
-echo "Starting PostgreSQL setup..."
+# Prefer platform-provided PORT (readiness checks use this). Allow DB_PORT override.
+DB_PORT="${DB_PORT:-${PORT:-5001}}"
+
+echo "Starting PostgreSQL setup on port ${DB_PORT}..."
 
 # Find PostgreSQL version and set paths
 PG_VERSION=$(ls /usr/lib/postgresql/ | head -1)
@@ -150,7 +157,7 @@ echo ""
 
 # Optional: initialize application schema + seed data
 # (kept separate so startup remains minimal; can be skipped by setting SKIP_APP_INIT=1)
-if [ "${SKIP_APP_INIT}" != "1" ] && [ -f "./init_schema_and_seed.sh" ]; then
+if [ "${SKIP_APP_INIT:-0}" != "1" ] && [ -f "./init_schema_and_seed.sh" ]; then
     echo ""
     echo "Initializing app schema + seed data..."
     bash ./init_schema_and_seed.sh || echo "⚠ App schema/seed init failed (see output above)"
